@@ -63,21 +63,53 @@ public class SendPulse : ISendPulse
         return sb.ToString();
     }
 
+    private JToken ParseJsonString(string jsonString)
+    {
+        var jsonStringTrimmed = jsonString?.Trim();
+        
+        if (string.IsNullOrEmpty(jsonStringTrimmed))
+        {
+            return null;
+        }
+
+        try
+        {
+            var jToken = JToken.Parse(jsonStringTrimmed);
+
+            JToken result = jToken.Type switch
+            {
+                JTokenType.Object => (JObject)jToken,
+                JTokenType.Array => (JArray)jToken,
+                _ => null,
+            };
+
+            if (result == null)
+            {
+                _logger.LogWarning(
+                    "Invalid JSON response from SendPulse API (jTokenType={jTokenType}): {sendPulseResponse}",
+                    jToken.Type, jsonStringTrimmed);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Can't parse JSON response from SendPulse API: {sendPulseResponse}",
+                jsonStringTrimmed);
+            return null;
+        }
+    }
+
     /// <summary>
     /// Form and send request to API service
     /// </summary>
-    /// <param name="path">string path</param>
-    /// <param name="method">string method</param>
-    /// <param name="data"><string, object> data</param>
-    /// <param name="useToken">Boolean useToken</param>
-    /// <returns>Dictionary<string, object> result data</returns>
-    public Dictionary<string, object> SendRequest(string path, string method, Dictionary<string, object> data,
+    public SendPulseResponse SendRequest(string path, string method, Dictionary<string, object> data,
         bool useToken = true)
     {
         var originalPath = path;
 
         string strReturn;
-        var responseDict = new Dictionary<string, object>();
+        var response = new SendPulseResponse();
         try
         {
             var stringdata = "";
@@ -107,47 +139,29 @@ public class SendPulse : ISendPulse
             {
                 var webResp = (HttpWebResponse)webReq.GetResponse();
                 var status = webResp.StatusCode;
-                responseDict.Add("http_code", (int)status);
+                response.HttpStatusCode = (int)status;
 
                 var webResponse = webResp.GetResponseStream();
-                var streamReader =
-                    new StreamReader(webResponse ?? throw new InvalidOperationException("web response is null"));
+                var streamReader = new StreamReader(webResponse ?? throw new InvalidOperationException("response stream is null"));
                 strReturn = streamReader.ReadToEnd();
-                if (strReturn.Length > 0)
-                {
-                    Object jo = null;
-                    try
-                    {
-                        jo = JsonConvert.DeserializeObject<Object>(strReturn.Trim());
-                        if (jo.GetType() == typeof(JObject))
-                            jo = (JObject)jo;
-                        else if (jo.GetType() == typeof(JArray))
-                            jo = (JArray)jo;
-                    }
-                    catch (JsonException jex)
-                    {
-                        _logger.LogError(jex, "Unexpected error");
-                    }
-
-                    responseDict.Add("data", jo);
-                }
+                response.Data = ParseJsonString(strReturn);
             }
             catch (WebException we)
             {
-                var wRespStatusCode = ((HttpWebResponse)we.Response).StatusCode;
+                var wRespStatusCode = ((HttpWebResponse)we.Response)?.StatusCode;
                 if (wRespStatusCode == HttpStatusCode.Unauthorized && _refreshToken == 0)
                 {
                     _refreshToken += 1;
                     GetToken();
-                    responseDict = SendRequest(originalPath, method, data, useToken);
+                    response = SendRequest(originalPath, method, data, useToken);
                 }
                 else
                 {
-                    responseDict.Add("http_code", (int)wRespStatusCode);
-                    var webResponse = ((HttpWebResponse)we.Response).GetResponseStream();
-                    var streamReader = new StreamReader(webResponse);
+                    response.HttpStatusCode = (int?)wRespStatusCode ?? 0;
+                    var webResponse = ((HttpWebResponse)we.Response)?.GetResponseStream();
+                    var streamReader = new StreamReader(webResponse ?? throw new InvalidOperationException("response stream is null") );
                     strReturn = streamReader.ReadToEnd();
-                    responseDict.Add("data", strReturn);
+                    response.Data = ParseJsonString(strReturn);
                 }
             }
         }
@@ -155,15 +169,18 @@ public class SendPulse : ISendPulse
         {
             _logger.LogError(ex, "Unexpected error");
         }
+        
+        if (response.HttpStatusCode != 200)
+        {
+            response.IsError = true;
+        }
 
-        return responseDict;
+        return response;
     }
 
     /// <summary>
     /// Make post data string
     /// </summary>
-    /// <param name="data">Dictionary<string, object> params</param>
-    /// <returns>string urlstring</returns>
     private string MakeRequestString(Dictionary<string, object> data)
     {
         var stringBuilder = new StringBuilder(64);
@@ -205,13 +222,13 @@ public class SendPulse : ISendPulse
     /// <param name="useToken">bool useToken</param>
     /// <returns>Dictionary</returns>
     /// <exception cref="NotSupportedException">When passed not supported HTTP method</exception>
-    public Dictionary<string, object> SendJsonRequest(string endpoint, HttpMethod method, object data,
+    public SendPulseResponse SendJsonRequest(string endpoint, HttpMethod method, object data,
         bool useToken = true)
     {
         if (method != HttpMethod.Get && method != HttpMethod.Post)
             throw new NotSupportedException("Method " + method + " not supported yet!");
 
-        var response = new Dictionary<string, object>();
+        var response = new SendPulseResponse();
         string strReturn;
 
         try
@@ -239,7 +256,7 @@ public class SendPulse : ISendPulse
             {
                 var webResponse = (HttpWebResponse)webRequest.GetResponse();
                 var status = webResponse.StatusCode;
-                response.Add("http_code", (int)status);
+                response.HttpStatusCode = (int)status;
 
                 if (status == HttpStatusCode.Unauthorized && _refreshToken == 0)
                 {
@@ -250,50 +267,24 @@ public class SendPulse : ISendPulse
                 else
                 {
                     var responseStream = webResponse.GetResponseStream();
-                    using (var streamReader = new StreamReader(responseStream ??
-                                                               throw new InvalidOperationException(
-                                                                   "response stream is null")))
+                    using (var streamReader = new StreamReader(responseStream ?? throw new InvalidOperationException("response stream is null")))
                     {
                         strReturn = streamReader.ReadToEnd();
                     }
 
-                    if (strReturn.Length > 0)
-                    {
-                        Object jo = null;
-                        try
-                        {
-                            jo = JsonConvert.DeserializeObject<Object>(strReturn.Trim());
-                            if (jo.GetType() == typeof(JObject))
-                            {
-                                jo = (JObject)jo;
-                            }
-                            else if (jo.GetType() == typeof(JArray))
-                            {
-                                jo = (JArray)jo;
-                            }
-                        }
-                        catch (JsonException ex)
-                        {
-                            _logger.LogError(ex, "Unexpected error");
-                        }
-
-                        response.Add("data", jo);
-                    }
+                    response.Data = ParseJsonString(strReturn);
                 }
             }
             catch (WebException ex)
             {
-                var statusCode = ((HttpWebResponse)ex.Response).StatusCode;
-                response.Add("http_code", (int)statusCode);
-                var responseStream = ((HttpWebResponse)ex.Response).GetResponseStream();
-                using (var streamReader =
-                       new StreamReader(
-                           responseStream ?? throw new InvalidOperationException("response stream is null")))
+                var statusCode = ((HttpWebResponse)ex.Response)?.StatusCode ?? 0;
+                response.HttpStatusCode = (int)statusCode;
+                var responseStream = ((HttpWebResponse)ex.Response)?.GetResponseStream();
+                using (var streamReader = new StreamReader(responseStream ?? throw new InvalidOperationException("response stream is null")))
                 {
                     strReturn = streamReader.ReadToEnd();
                 }
-
-                response.Add("data", strReturn);
+                response.Data = ParseJsonString(strReturn);
             }
         }
         catch (Exception ex)
@@ -301,6 +292,11 @@ public class SendPulse : ISendPulse
             _logger.LogError(ex, "Unexpected error");
         }
 
+        if (response.HttpStatusCode != 200)
+        {
+            response.IsError = true;
+        }
+        
         return response;
     }
 
@@ -314,7 +310,7 @@ public class SendPulse : ISendPulse
         data.Add("grant_type", "client_credentials");
         data.Add("client_id", _userId);
         data.Add("client_secret", _secret);
-        Dictionary<string, object> requestResult = null;
+        SendPulseResponse requestResult = null;
         try
         {
             requestResult = SendRequest("oauth/access_token", "POST", data, false);
@@ -325,53 +321,29 @@ public class SendPulse : ISendPulse
         }
 
         if (requestResult == null) return false;
-        if ((int)requestResult["http_code"] != 200)
+        if (requestResult.HttpStatusCode != 200)
             return false;
         _refreshToken = 0;
-        var jdata = (JObject)requestResult["data"];
-        if (jdata.GetType() == typeof(JObject))
+        if (requestResult.Data.Type == JTokenType.Object)
         {
-            _accessToken = jdata["access_token"]?.ToString();
+            _accessToken = ((JObject)requestResult.Data)["access_token"]?.ToString();
         }
 
         return true;
     }
 
     /// <summary>
-    /// Process results
-    /// </summary>
-    /// <param name="data">Dictionary<string, object> data</param>
-    /// <returns>Dictionary<string, object> data</returns>
-    private Dictionary<string, object> HandleResult(Dictionary<string, object> data)
-    {
-        if (!data.ContainsKey("data") || data.Count == 0)
-        {
-            data.Add("data", null);
-        }
-
-        if ((int)data["http_code"] != 200)
-        {
-            data.Add("is_error", true);
-        }
-
-        return data;
-    }
-
-    /// <summary>
     /// Process errors
     /// </summary>
-    /// <param name="customMessage">String Error message</param>
-    /// <returns>Dictionary<string, object> data</returns>
-    private Dictionary<string, object> HandleError(string customMessage)
+    private SendPulseResponse HandleError(string customMessage)
     {
-        var data = new Dictionary<string, object>();
-        data.Add("is_error", true);
-        if (customMessage != null && customMessage.Length > 0)
+        return new SendPulseResponse
         {
-            data.Add("message", customMessage);
-        }
-
-        return data;
+            HttpStatusCode = 0,
+            IsError = true,
+            Data = null,
+            SdkErrorMessage = customMessage,
+        };
     }
 
     /// <summary>
@@ -380,12 +352,12 @@ public class SendPulse : ISendPulse
     /// <param name="limit"></param>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public Dictionary<string, object> ListAddressBooks(int limit, int offset)
+    public SendPulseResponse ListAddressBooks(int limit, int offset)
     {
         var data = new Dictionary<string, object>();
         if (limit > 0) data.Add("limit", limit);
         if (offset > 0) data.Add("offset", offset);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks", "GET", data);
@@ -395,7 +367,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -403,10 +375,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetBookInfo(int id)
+    public SendPulseResponse GetBookInfo(int id)
     {
         if (id <= 0) return HandleError("Empty book id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + id, "GET", null);
@@ -416,7 +388,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -424,10 +396,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetEmailsFromBook(int id)
+    public SendPulseResponse GetEmailsFromBook(int id)
     {
         if (id <= 0) return HandleError("Empty book id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + id + "/emails", "GET", null);
@@ -437,7 +409,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -445,10 +417,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> RemoveAddressBook(int id)
+    public SendPulseResponse RemoveAddressBook(int id)
     {
         if (id <= 0) return HandleError("Empty book id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + id, "DELETE", null);
@@ -458,7 +430,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -467,12 +439,12 @@ public class SendPulse : ISendPulse
     /// <param name="id">String book id</param>
     /// <param name="newname">String book new name</param>
     /// <returns></returns>
-    public Dictionary<string, object> EditAddressBook(int id, string newname)
+    public SendPulseResponse EditAddressBook(int id, string newname)
     {
         if (id <= 0 || newname.Length == 0) return HandleError("Empty new name or book id");
         var data = new Dictionary<string, object>();
         data.Add("name", newname);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + id, "PUT", data);
@@ -482,7 +454,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -490,12 +462,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="bookName"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CreateAddressBook(string bookName)
+    public SendPulseResponse CreateAddressBook(string bookName)
     {
         if (bookName.Length == 0) return HandleError("Empty book name");
         var data = new Dictionary<string, object>();
         data.Add("bookName", bookName);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks", "POST", data);
@@ -505,7 +477,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -514,12 +486,12 @@ public class SendPulse : ISendPulse
     /// <param name="bookId">int book id</param>
     /// <param name="emails">String A serialized array of emails</param>
     /// <returns></returns>
-    public Dictionary<string, object> AddEmails(int bookId, string emails)
+    public SendPulseResponse AddEmails(int bookId, string emails)
     {
         if (bookId <= 0 || emails.Length == 0) return HandleError("Empty book id or emails");
         var data = new Dictionary<string, object>();
         data.Add("emails", emails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + bookId + "/emails", "POST", data);
@@ -529,7 +501,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -538,12 +510,12 @@ public class SendPulse : ISendPulse
     /// <param name="bookId">int book id</param>
     /// <param name="emails">String A serialized array of emails</param>
     /// <returns></returns>
-    public Dictionary<string, object> RemoveEmails(int bookId, string emails)
+    public SendPulseResponse RemoveEmails(int bookId, string emails)
     {
         if (bookId <= 0 || emails.Length == 0) return HandleError("Empty book id or emails");
         var data = new Dictionary<string, object>();
         data.Add("emails", emails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + bookId + "/emails", "DELETE", data);
@@ -553,7 +525,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -562,10 +534,10 @@ public class SendPulse : ISendPulse
     /// <param name="bookId"></param>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetEmailInfo(int bookId, string email)
+    public SendPulseResponse GetEmailInfo(int bookId, string email)
     {
         if (bookId <= 0 || email.Length == 0) return HandleError("Empty book id or email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + bookId + "/emails/" + email, "GET", null);
@@ -575,7 +547,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -583,10 +555,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="bookId"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CampaignCost(int bookId)
+    public SendPulseResponse CampaignCost(int bookId)
     {
         if (bookId <= 0) return HandleError("Empty book id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("addressbooks/" + bookId + "/cost", "GET", null);
@@ -596,7 +568,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -605,12 +577,12 @@ public class SendPulse : ISendPulse
     /// <param name="limit"></param>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public Dictionary<string, object> ListCampaigns(int limit, int offset)
+    public SendPulseResponse ListCampaigns(int limit, int offset)
     {
         var data = new Dictionary<string, object>();
         if (limit > 0) data.Add("limit", limit);
         if (offset > 0) data.Add("offset", offset);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns", "GET", data);
@@ -620,7 +592,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -628,9 +600,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetCampaignInfo(int id)
+    public SendPulseResponse GetCampaignInfo(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns/" + id, "GET", null);
@@ -640,7 +612,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -648,10 +620,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CampaignStatByCountries(int id)
+    public SendPulseResponse CampaignStatByCountries(int id)
     {
         if (id <= 0) return HandleError("Empty campaign id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns/" + id + "/countries", "GET", null);
@@ -661,7 +633,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -669,10 +641,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CampaignStatByReferrals(int id)
+    public SendPulseResponse CampaignStatByReferrals(int id)
     {
         if (id <= 0) return HandleError("Empty campaign id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns/" + id + "/referrals", "GET", null);
@@ -682,7 +654,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -697,7 +669,7 @@ public class SendPulse : ISendPulse
     /// <param name="sendDate"></param>
     /// <param name="attachments"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CreateCampaign(string senderName, string senderEmail, string subject, string body,
+    public SendPulseResponse CreateCampaign(string senderName, string senderEmail, string subject, string body,
         int bookId, string name, string sendDate = "", string attachments = "")
     {
         if (senderName.Length == 0 || senderEmail.Length == 0 || subject.Length == 0 || body.Length == 0 || bookId <= 0)
@@ -712,7 +684,7 @@ public class SendPulse : ISendPulse
         if (encodedBody.Length > 0) data.Add("body", encodedBody);
         data.Add("list_id", bookId);
         if (name.Length > 0) data.Add("name", name);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns", "POST", data);
@@ -722,7 +694,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -730,10 +702,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CancelCampaign(int id)
+    public SendPulseResponse CancelCampaign(int id)
     {
         if (id <= 0) return HandleError("Empty campaign id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("campaigns/" + id, "DELETE", null);
@@ -743,16 +715,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Get list of allowed senders
     /// </summary>
     /// <returns></returns>
-    public Dictionary<string, object> ListSenders()
+    public SendPulseResponse ListSenders()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("senders", "GET", null);
@@ -762,7 +734,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -771,13 +743,13 @@ public class SendPulse : ISendPulse
     /// <param name="senderName"></param>
     /// <param name="senderEmail"></param>
     /// <returns></returns>
-    public Dictionary<string, object> AddSender(string senderName, string senderEmail)
+    public SendPulseResponse AddSender(string senderName, string senderEmail)
     {
         if (senderName.Length == 0 || senderEmail.Length == 0) return HandleError("Empty sender name or email");
         var data = new Dictionary<string, object>();
         data.Add("name", senderName);
         data.Add("email", senderEmail);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("senders", "POST", data);
@@ -787,7 +759,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -795,12 +767,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> RemoveSender(string email)
+    public SendPulseResponse RemoveSender(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
         var data = new Dictionary<string, object>();
         data.Add("email", email);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("senders", "DELETE", data);
@@ -810,7 +782,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -819,12 +791,12 @@ public class SendPulse : ISendPulse
     /// <param name="email"></param>
     /// <param name="code"></param>
     /// <returns></returns>
-    public Dictionary<string, object> ActivateSender(string email, string code)
+    public SendPulseResponse ActivateSender(string email, string code)
     {
         if (email.Length == 0 || code.Length == 0) return HandleError("Empty email or activation code");
         var data = new Dictionary<string, object>();
         data.Add("code", code);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("senders/" + email + "/code", "POST", data);
@@ -834,7 +806,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -842,10 +814,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetSenderActivationMail(string email)
+    public SendPulseResponse GetSenderActivationMail(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("senders/" + email + "/code", "GET", null);
@@ -855,7 +827,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -863,10 +835,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetEmailGlobalInfo(string email)
+    public SendPulseResponse GetEmailGlobalInfo(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("emails/" + email, "GET", null);
@@ -876,7 +848,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -884,10 +856,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> RemoveEmailFromAllBooks(string email)
+    public SendPulseResponse RemoveEmailFromAllBooks(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("emails/" + email, "DELETE", null);
@@ -897,7 +869,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -905,10 +877,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> EmailStatByCampaigns(string email)
+    public SendPulseResponse EmailStatByCampaigns(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("emails/" + email + "/campaigns", "GET", null);
@@ -918,16 +890,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Show emails from blacklist
     /// </summary>
     /// <returns></returns>
-    public Dictionary<string, object> GetBlackList()
+    public SendPulseResponse GetBlackList()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("blacklist", "GET", null);
@@ -937,7 +909,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -945,13 +917,13 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="emails"></param>
     /// <returns></returns>
-    public Dictionary<string, object> AddToBlackList(string emails)
+    public SendPulseResponse AddToBlackList(string emails)
     {
         if (emails.Length == 0) return HandleError("Empty emails");
         var data = new Dictionary<string, object>();
         var encodedemails = Base64Encode(emails);
         data.Add("emails", encodedemails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("blacklist", "POST", data);
@@ -961,7 +933,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -969,13 +941,13 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="emails"></param>
     /// <returns></returns>
-    public Dictionary<string, object> RemoveFromBlackList(string emails)
+    public SendPulseResponse RemoveFromBlackList(string emails)
     {
         if (emails.Length == 0) return HandleError("Empty emails");
         var data = new Dictionary<string, object>();
         var encodedemails = Base64Encode(emails);
         data.Add("emails", encodedemails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("blacklist", "DELETE", data);
@@ -985,7 +957,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -993,7 +965,7 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="currency"></param>
     /// <returns></returns>
-    public Dictionary<string, object> GetBalance(string currency)
+    public SendPulseResponse GetBalance(string currency)
     {
         var url = "balance";
         if (currency.Length > 0)
@@ -1002,7 +974,7 @@ public class SendPulse : ISendPulse
             url = url + "/" + currency;
         }
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest(url, "GET", null);
@@ -1012,7 +984,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1020,7 +992,7 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="emaildata"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpSendMail(Dictionary<string, object> emaildata)
+    public SendPulseResponse SmtpSendMail(Dictionary<string, object> emaildata)
     {
         if (emaildata.Count == 0) return HandleError("Empty email data");
         var html = emaildata["html"].ToString();
@@ -1029,7 +1001,7 @@ public class SendPulse : ISendPulse
         var data = new Dictionary<string, object>();
         var serialized = JsonConvert.SerializeObject(emaildata);
         data.Add("email", serialized);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/emails", "POST", data);
@@ -1039,7 +1011,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1052,7 +1024,7 @@ public class SendPulse : ISendPulse
     /// <param name="sender"></param>
     /// <param name="recipient"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpListEmails(int limit, int offset, string fromDate, string toDate,
+    public SendPulseResponse SmtpListEmails(int limit, int offset, string fromDate, string toDate,
         string sender, string recipient)
     {
         var data = new Dictionary<string, object>();
@@ -1062,7 +1034,7 @@ public class SendPulse : ISendPulse
         if (toDate.Length > 0) data.Add("to", toDate);
         if (sender.Length > 0) data.Add("sender", sender);
         if (recipient.Length > 0) data.Add("recipient", recipient);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/emails", "GET", data);
@@ -1072,7 +1044,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1080,10 +1052,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpGetEmailInfoById(string id)
+    public SendPulseResponse SmtpGetEmailInfoById(string id)
     {
         if (id.Length == 0) return HandleError("Empty id");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/emails/" + id, "GET", null);
@@ -1093,7 +1065,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1101,12 +1073,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="emails"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpUnsubscribeEmails(string emails)
+    public SendPulseResponse SmtpUnsubscribeEmails(string emails)
     {
         if (emails.Length == 0) return HandleError("Empty emails");
         var data = new Dictionary<string, object>();
         data.Add("emails", emails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/smtp/unsubscribe", "POST", data);
@@ -1116,7 +1088,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1124,12 +1096,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="emails"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpRemoveFromUnsubscribe(string emails)
+    public SendPulseResponse SmtpRemoveFromUnsubscribe(string emails)
     {
         if (emails.Length == 0) return HandleError("Empty emails");
         var data = new Dictionary<string, object>();
         data.Add("emails", emails);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/smtp/unsubscribe", "DELETE", data);
@@ -1139,16 +1111,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Get list of allowed IPs using SMTP
     /// </summary>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpListIp()
+    public SendPulseResponse SmtpListIp()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/ips", "GET", null);
@@ -1158,16 +1130,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Get list of allowed domains using SMTP
     /// </summary>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpListAllowedDomains()
+    public SendPulseResponse SmtpListAllowedDomains()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/domains", "GET", null);
@@ -1177,7 +1149,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1185,12 +1157,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpAddDomain(string email)
+    public SendPulseResponse SmtpAddDomain(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
         var data = new Dictionary<string, object>();
         data.Add("email", email);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/domains", "POST", data);
@@ -1200,7 +1172,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1208,10 +1180,10 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="email"></param>
     /// <returns></returns>
-    public Dictionary<string, object> SmtpVerifyDomain(string email)
+    public SendPulseResponse SmtpVerifyDomain(string email)
     {
         if (email.Length == 0) return HandleError("Empty email");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("smtp/domains/" + email, "GET", null);
@@ -1221,7 +1193,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1230,12 +1202,12 @@ public class SendPulse : ISendPulse
     /// <param name="limit"></param>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushListCampaigns(int limit, int offset)
+    public SendPulseResponse PushListCampaigns(int limit, int offset)
     {
         var data = new Dictionary<string, object>();
         if (limit > 0) data.Add("limit", limit);
         if (offset > 0) data.Add("offset", offset);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("push/tasks", "GET", data);
@@ -1245,7 +1217,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1253,11 +1225,11 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushCampaignInfo(int id)
+    public SendPulseResponse PushCampaignInfo(int id)
     {
         if (id > 0)
         {
-            Dictionary<string, object> result = null;
+            SendPulseResponse result = null;
             try
             {
                 result = SendRequest("push/tasks/" + id, "GET", null);
@@ -1267,7 +1239,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("No such push campaign");
@@ -1277,9 +1249,9 @@ public class SendPulse : ISendPulse
     /// Get amount of websites
     /// </summary>
     /// <returns></returns>
-    public Dictionary<string, object> PushCountWebsites()
+    public SendPulseResponse PushCountWebsites()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("push/websites/total", "GET", null);
@@ -1289,7 +1261,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1298,12 +1270,12 @@ public class SendPulse : ISendPulse
     /// <param name="limit"></param>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushListWebsites(int limit, int offset)
+    public SendPulseResponse PushListWebsites(int limit, int offset)
     {
         var data = new Dictionary<string, object>();
         if (limit > 0) data.Add("limit", limit);
         if (offset > 0) data.Add("offset", offset);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("push/websites", "GET", data);
@@ -1313,7 +1285,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1321,9 +1293,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushListWebsiteVariables(int id)
+    public SendPulseResponse PushListWebsiteVariables(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1338,7 +1310,7 @@ public class SendPulse : ISendPulse
             }
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1348,9 +1320,9 @@ public class SendPulse : ISendPulse
     /// <param name="limit"></param>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushListWebsiteSubscriptions(int id, int limit, int offset)
+    public SendPulseResponse PushListWebsiteSubscriptions(int id, int limit, int offset)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1367,7 +1339,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1378,9 +1350,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <param name="id"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushCountWebsiteSubscriptions(int id)
+    public SendPulseResponse PushCountWebsiteSubscriptions(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1394,7 +1366,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1406,14 +1378,14 @@ public class SendPulse : ISendPulse
     /// <param name="id"></param>
     /// <param name="state"></param>
     /// <returns></returns>
-    public Dictionary<string, object> PushSetSubscriptionState(int id, int state)
+    public SendPulseResponse PushSetSubscriptionState(int id, int state)
     {
         if (id > 0)
         {
             var data = new Dictionary<string, object>();
             data.Add("id", id);
             data.Add("state", state);
-            Dictionary<string, object> result = null;
+            SendPulseResponse result = null;
             try
             {
                 result = SendRequest("push/subscriptions/state", "POST", data);
@@ -1423,7 +1395,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1435,7 +1407,7 @@ public class SendPulse : ISendPulse
     /// <param name="taskinfo"></param>
     /// <param name="additionalParams"></param>
     /// <returns></returns>
-    public Dictionary<string, object> CreatePushTask(Dictionary<string, object> taskinfo,
+    public SendPulseResponse CreatePushTask(Dictionary<string, object> taskinfo,
         Dictionary<string, object> additionalParams)
     {
         var data = taskinfo;
@@ -1453,7 +1425,7 @@ public class SendPulse : ISendPulse
             }
         }
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("push/tasks", "POST", data);
@@ -1463,7 +1435,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1472,13 +1444,13 @@ public class SendPulse : ISendPulse
     /// <returns>The phones.</returns>
     /// <param name="bookId">Book identifier.</param>
     /// <param name="phones">Phones.</param>
-    public Dictionary<string, object> AddPhones(int bookId, string phones)
+    public SendPulseResponse AddPhones(int bookId, string phones)
     {
         if (bookId <= 0 || phones.Length == 0) return HandleError("Empty book id or phones");
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
         data.Add("addressBookId", bookId);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/numbers", "POST", data);
@@ -1488,7 +1460,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1497,13 +1469,13 @@ public class SendPulse : ISendPulse
     /// <returns>The phones.</returns>
     /// <param name="bookId">Book identifier.</param>
     /// <param name="phones">Phones.</param>
-    public Dictionary<string, object> RemovePhones(int bookId, string phones)
+    public SendPulseResponse RemovePhones(int bookId, string phones)
     {
         if (bookId <= 0 || phones.Length == 0) return HandleError("Empty book id or phones");
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
         data.Add("addressBookId", bookId);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/numbers", "DELETE", data);
@@ -1513,7 +1485,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1523,14 +1495,14 @@ public class SendPulse : ISendPulse
     /// <param name="bookId">Book identifier.</param>
     /// <param name="phones">Phones.</param>
     /// <param name="variables">Variables.</param>
-    public Dictionary<string, object> UpdatePhones(int bookId, string phones, string variables)
+    public SendPulseResponse UpdatePhones(int bookId, string phones, string variables)
     {
         if (bookId <= 0 || phones.Length == 0) return HandleError("Empty book id or phones");
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
         data.Add("variables", variables);
         data.Add("addressBookId", bookId);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/numbers", "PUT", data);
@@ -1540,7 +1512,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1549,9 +1521,9 @@ public class SendPulse : ISendPulse
     /// <returns>The phone info.</returns>
     /// <param name="bookId">Book identifier.</param>
     /// <param name="phoneNumber">Phone number.</param>
-    public Dictionary<string, object> GetPhoneInfo(int bookId, string phoneNumber)
+    public SendPulseResponse GetPhoneInfo(int bookId, string phoneNumber)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (bookId > 0)
         {
@@ -1565,7 +1537,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1577,7 +1549,7 @@ public class SendPulse : ISendPulse
     /// <returns>The phone to black list.</returns>
     /// <param name="phones">Phones.</param>
     /// <param name="description">Description.</param>
-    public Dictionary<string, object> AddPhonesToBlackList(string phones, string description)
+    public SendPulseResponse AddPhonesToBlackList(string phones, string description)
     {
         if (phones.Length == 0) return HandleError("Empty phones");
         var data = new Dictionary<string, object>();
@@ -1587,7 +1559,7 @@ public class SendPulse : ISendPulse
             data.Add("description", description);
         }
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/black_list", "POST", data);
@@ -1597,7 +1569,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1605,12 +1577,12 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The phones from black list.</returns>
     /// <param name="phones">Phones.</param>
-    public Dictionary<string, object> RemovePhonesFromBlackList(string phones)
+    public SendPulseResponse RemovePhonesFromBlackList(string phones)
     {
         if (phones.Length == 0) return HandleError("Empty phones");
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/black_list", "DELETE", data);
@@ -1620,16 +1592,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Get black list of phone numbers.
     /// </summary>
     /// <returns>The black list phones.</returns>
-    public Dictionary<string, object> GetBlackListPhones()
+    public SendPulseResponse GetBlackListPhones()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var url = "/sms/black_list";
         try
         {
@@ -1640,16 +1612,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Retrieving information of telephone numbers in the blacklist
     /// </summary>
     /// <returns>The phones info in black list.</returns>
-    public Dictionary<string, object> GetPhonesInfoInBlackList(string phones)
+    public SendPulseResponse GetPhonesInfoInBlackList(string phones)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
         var url = "/sms/black_list/by_numbers";
@@ -1662,7 +1634,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
 
@@ -1675,7 +1647,7 @@ public class SendPulse : ISendPulse
     /// <param name="transliterate">Transliterate.</param>
     /// <param name="sender">Sender.</param>
     /// <param name="date">Date.</param>
-    public Dictionary<string, object> SendSmsCampaign(int bookId, string body, int transliterate = 1,
+    public SendPulseResponse SendSmsCampaign(int bookId, string body, int transliterate = 1,
         string sender = "", string date = "")
     {
         if (body.Length == 0) return HandleError("Empty Body");
@@ -1694,7 +1666,7 @@ public class SendPulse : ISendPulse
             data.Add("date", date);
         }
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/campaigns", "POST", data);
@@ -1704,7 +1676,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1716,7 +1688,7 @@ public class SendPulse : ISendPulse
     /// <param name="transliterate">Transliterate.</param>
     /// <param name="sender">Sender.</param>
     /// <param name="date">Date.</param>
-    public Dictionary<string, object> SendSmsCampaignByPhones(string phones, string body, int transliterate = 1,
+    public SendPulseResponse SendSmsCampaignByPhones(string phones, string body, int transliterate = 1,
         string sender = "", string date = "")
     {
         if (body.Length == 0) return HandleError("Empty Body");
@@ -1735,7 +1707,7 @@ public class SendPulse : ISendPulse
             data.Add("date", date);
         }
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/send", "POST", data);
@@ -1745,7 +1717,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1754,9 +1726,9 @@ public class SendPulse : ISendPulse
     /// <returns>The sms campaigns list.</returns>
     /// <param name="dateFrom">Date from.</param>
     /// <param name="dateTo">Date to.</param>
-    public Dictionary<string, object> GetSmsCampaignsList(string dateFrom, string dateTo)
+    public SendPulseResponse GetSmsCampaignsList(string dateFrom, string dateTo)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var data = new Dictionary<string, object>();
         data.Add("dateFrom", dateFrom);
         data.Add("dateTo", dateTo);
@@ -1770,7 +1742,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1778,9 +1750,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The sms campaign info.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> GetSmsCampaignInfo(int id)
+    public SendPulseResponse GetSmsCampaignInfo(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1794,7 +1766,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1805,9 +1777,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The sms campaign.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> CancelSmsCampaign(int id)
+    public SendPulseResponse CancelSmsCampaign(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1821,7 +1793,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1835,11 +1807,11 @@ public class SendPulse : ISendPulse
     /// <param name="sender">Sender.</param>
     /// <param name="addressBookId">Address book identifier.</param>
     /// <param name="phones">Phones.</param>
-    public Dictionary<string, object> GetSmsCampaignCost(string body, string sender, int addressBookId = 0,
+    public SendPulseResponse GetSmsCampaignCost(string body, string sender, int addressBookId = 0,
         string phones = "")
     {
         if (body.Length == 0) return HandleError("Empty Body");
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var data = new Dictionary<string, object>();
         data.Add("body", body);
         data.Add("sender", sender);
@@ -1867,7 +1839,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1875,9 +1847,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The sms campaign.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> DeleteSmsCampaign(int id)
+    public SendPulseResponse DeleteSmsCampaign(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         string url;
         if (id > 0)
         {
@@ -1893,7 +1865,7 @@ public class SendPulse : ISendPulse
                 _logger.LogWarning(ex, "Unexpected error");
             }
 
-            return HandleResult(result);
+            return result;
         }
 
         return HandleError("Empty ID");
@@ -1905,14 +1877,14 @@ public class SendPulse : ISendPulse
     /// <returns>The phones to addreess book.</returns>
     /// <param name="addressBookId">Address book identifier.</param>
     /// <param name="phones">Phones.</param>
-    public Dictionary<string, object> AddPhonesToAddreessBook(int addressBookId, string phones)
+    public SendPulseResponse AddPhonesToAddreessBook(int addressBookId, string phones)
     {
         if (addressBookId <= 0) return HandleError("Empty address book id");
         if (phones.Length == 0) return HandleError("Empty phones");
         var data = new Dictionary<string, object>();
         data.Add("phones", phones);
         data.Add("addressBookId", addressBookId);
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendRequest("/sms/numbers/variables", "POST", data);
@@ -1922,15 +1894,15 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Send viber campaign.
     /// </summary>
-    /// <<param name="viberCampaign">Viber campaign to create</param>
+    /// <param name="viberCampaign">Viber campaign to create</param>
     /// <returns>The viber campaign.</returns>
-    public Dictionary<string, object> SendViberCampaign(ViberCampaign viberCampaign)
+    public SendPulseResponse SendViberCampaign(ViberCampaign viberCampaign)
     {
         if (viberCampaign.AddressBook == 0 && viberCampaign.Recipients.Length == 0)
             return HandleError("Empty recipients list");
@@ -1941,7 +1913,7 @@ public class SendPulse : ISendPulse
         if (viberCampaign.SenderId == 0)
             return HandleError("Empty sender");
 
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         try
         {
             result = SendJsonRequest("/viber", HttpMethod.Post, viberCampaign);
@@ -1951,16 +1923,16 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
     /// Get viber senders list.
     /// </summary>
     /// <returns>The viber senders.</returns>
-    public Dictionary<string, object> GetViberSenders()
+    public SendPulseResponse GetViberSenders()
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var url = "/viber/senders";
         try
         {
@@ -1971,7 +1943,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -1980,9 +1952,9 @@ public class SendPulse : ISendPulse
     /// <returns>The viber tasks list.</returns>
     /// <param name="limit">Limit.</param>
     /// <param name="offset">Offset.</param>
-    public Dictionary<string, object> GetViberTasksList(int limit = 100, int offset = 0)
+    public SendPulseResponse GetViberTasksList(int limit = 100, int offset = 0)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         var data = new Dictionary<string, object>();
         data.Add("limit", limit);
         data.Add("offset", offset);
@@ -1996,7 +1968,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -2004,9 +1976,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The viber campaign stat.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> GetViberCampaignStat(int id)
+    public SendPulseResponse GetViberCampaignStat(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         if (id <= 0) return HandleError("Empty id");
         var url = "/viber/task/" + id;
         try
@@ -2018,7 +1990,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -2026,9 +1998,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The viber sender.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> GetViberSender(int id)
+    public SendPulseResponse GetViberSender(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         if (id <= 0) return HandleError("Empty id");
         var url = "/viber/senders/" + id;
         try
@@ -2040,7 +2012,7 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 
     /// <summary>
@@ -2048,9 +2020,9 @@ public class SendPulse : ISendPulse
     /// </summary>
     /// <returns>The viber task recipients.</returns>
     /// <param name="id">Identifier.</param>
-    public Dictionary<string, object> GetViberTaskRecipients(int id)
+    public SendPulseResponse GetViberTaskRecipients(int id)
     {
-        Dictionary<string, object> result = null;
+        SendPulseResponse result = null;
         if (id <= 0) return HandleError("Empty id");
         var url = "/viber/task/" + id + "/recipients";
         try
@@ -2062,6 +2034,6 @@ public class SendPulse : ISendPulse
             _logger.LogWarning(ex, "Unexpected error");
         }
 
-        return HandleResult(result);
+        return result;
     }
 }
